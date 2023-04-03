@@ -317,16 +317,31 @@ copyuvm(pde_t *pgdir, uint sz)
 {
   pde_t *d;
   pte_t *pte;
-  uint pa, i, flags;
+  uint pa, i, flags, tmp;
   char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
   for(i = 0; i < sz; i += PGSIZE){
+    tmp = *pte;
+
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+
+    if((*pte & PTE_U))
+      cprintf("is user page\n");
+    else
+      cprintf("is not user page\n");
+
+    tmp &= ~PTE_W;
+
+    if(!(tmp & PTE_W))
+      cprintf("writeable removed\n");
+    else
+      cprintf("writeable not\n");
+    
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -337,6 +352,48 @@ copyuvm(pde_t *pgdir, uint sz)
       goto bad;
     }
   }
+  return d;
+
+bad:
+  freevm(d);
+  return 0;
+}
+
+// Given a parent process's page table, create a copy
+// of it for a child. - ccc13d
+pde_t*
+copyuvm_cow(pde_t *pgdir, uint sz){
+  pte_t *d;                 /* page directory for ch proc */
+  pte_t *pte;               /* parent page table entry ptr */
+  uint pa, i, flags;
+  char *mem;
+
+  if((d = setupkvm()) == 0) /* map kernel to child process */
+    return 0;
+  
+  for(i = 0; i < sz; i += PGSIZE){                    
+    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0) /* read parent's page tbl entry */
+      panic("copyuvm: pte should exist");
+
+    if(!(*pte & PTE_P)) /* check if parent pte is present */
+      panic("copyuvm: page not present");
+
+    pa = PTE_ADDR(*pte);    /* get physical addr */
+    flags = PTE_FLAGS(*pte);
+
+    flags &= ~PTE_W;        /* get rid of write flag */
+
+    if((mem = kalloc()) == 0) /* alloc a new page */
+      goto bad;
+
+    memmove(mem, (char*)P2V(pa), PGSIZE); /* copy parent memory to new page */
+
+    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {  /* map new page to ch process */
+      kfree(mem);
+      goto bad;
+    }
+  }
+
   return d;
 
 bad:
