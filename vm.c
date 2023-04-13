@@ -271,7 +271,10 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       if(pa == 0)
         panic("kfree");
       char *v = P2V(pa);
-      kfree(v);
+      
+      if((*pte & PTE_W) != 0)
+        kfree(v);
+
       *pte = 0;
     }
   }
@@ -317,30 +320,16 @@ copyuvm(pde_t *pgdir, uint sz)
 {
   pde_t *d;
   pte_t *pte;
-  uint pa, i, flags, tmp;
+  uint pa, i, flags;
   char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
   for(i = 0; i < sz; i += PGSIZE){
-    tmp = *pte;
-
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
-
-    if((*pte & PTE_U))
-      cprintf("is user page\n");
-    else
-      cprintf("is not user page\n");
-
-    tmp &= ~PTE_W;
-
-    if(!(tmp & PTE_W))
-      cprintf("writeable removed\n");
-    else
-      cprintf("writeable not\n");
     
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
@@ -368,29 +357,33 @@ copyuvm_cow(pde_t *pgdir, uint sz){
   uint pa, i, flags;
   char *mem;
 
-  if((d = setupkvm()) == 0) /* map kernel to child process */
+  if((d = setupkvm()) == 0)
     return 0;
-  
-  for(i = 0; i < sz; i += PGSIZE){                    
-    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0) /* read parent's page tbl entry */
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
-
-    if(!(*pte & PTE_P)) /* check if parent pte is present */
+    if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
-
-    pa = PTE_ADDR(*pte);    /* get physical addr */
+    
+    pa = PTE_ADDR(*pte);      /* get physical address */
     flags = PTE_FLAGS(*pte);
 
-    flags &= ~PTE_W;        /* get rid of write flag */
+    if((flags & PTE_U) != 0){     /* entry is for user-mode memory - do not copy */
+      flags &= ~PTE_W;     /* remove write flag */
+      
+      if(mappages(d, (void *)i, PGSIZE, pa, flags) < 0)
+        goto bad;
+    }
+    else{
+      if((mem = kalloc()) == 0) /* allocate new page */
+        goto bad;
 
-    if((mem = kalloc()) == 0) /* alloc a new page */
-      goto bad;
+      memmove(mem, (char*)P2V(pa), PGSIZE); /* copy parent memory to this page */
 
-    memmove(mem, (char*)P2V(pa), PGSIZE); /* copy parent memory to new page */
-
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {  /* map new page to ch process */
-      kfree(mem);
-      goto bad;
+      if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {  /* maps new page to the child process */
+        kfree(mem);
+        goto bad;
+      }
     }
   }
 
@@ -399,6 +392,44 @@ copyuvm_cow(pde_t *pgdir, uint sz){
 bad:
   freevm(d);
   return 0;
+}
+
+void
+handle_pgflt(void){
+  uint faulting_addr, pa, flags;
+  pte_t *pte;
+  char* mem;
+
+  faulting_addr = read_cr2(); /* read the faulting address from cr2 */
+
+  /* get the physical address of the currently mapped physical frame from the page table (walkpgdir) */
+  if((pte = walkpgdir(myproc()->pgdir, (void *) faulting_addr, 0)) == 0)
+    panic("handle_pgflt: pte should exist");
+
+  if(!(*pte & PTE_P))
+    panic("handle_pgflt: page not present");
+  
+  pa = PTE_ADDR(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  /* clone the frame into a new page */
+  if((mem = kalloc()) == 0)
+    return;
+
+  memmove(mem, (char *)P2V(pa), PGSIZE);
+
+  /* map the new page into the current process writable */
+  if((flags & PTE_W) == 0)
+    flags &= PTE_W;
+
+  if(mappages(myproc()->pgdir, (void *) faulting_addr, PGSIZE, V2P(mem), flags) < 0){
+    kfree(mem);
+    return;
+  }
+
+  flush_tbl_all();  /* flush the TLB (flush_tlb_all) */
+  
+  return;
 }
 
 //PAGEBREAK!
