@@ -9,7 +9,7 @@
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
-uchar num_of_shares[PHYSTOP/PGSIZE];
+uchar shares[PHYSTOP/PGSIZE];
 
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
@@ -387,51 +387,31 @@ void
 handle_pgflt(void){
   char *mem;
   pte_t *pte;
-  uint pa;
+  uint pa, faultaddr = read_cr2();
   
-  uint faultingAddress = read_cr2();
-
-  if (faultingAddress==0) {
-    cprintf("NULL POINTER EXCEPTION! kill&exit\n");
-    myproc()->killed = 1;
-    exit();
-  }
-  
-  if ((pte = walkpgdir(myproc()->pgdir, (void*)faultingAddress , 0)) == 0)
+  if ((pte = walkpgdir(myproc()->pgdir, (void*)faultaddr , 0)) == 0)
     panic("handle_pgflt: pte should exist");
   if(!(*pte & PTE_P))
       panic("handle_pgflt: page not present");
   
   pa = PTE_ADDR(*pte);
   
-  // case1: the process who enters is the last one between the process who share this page
-  if ((num_of_shares[pa/PGSIZE] == 0) && ((*pte)& PTE_WAS_WRITABLE)) {
-    *pte &= ~PTE_SH;  // disable Sharing for this page
-    *pte &= ~PTE_WAS_WRITABLE;  // no need for the ORIGINALLY writable flag
-    *pte |= PTE_W;	// update to writable
-    goto finish_hadle_pgflt;
+  if ((shares[pa/PGSIZE] == 0) && (*pte & PTE_WW)) {
+    *pte &= ~PTE_SH;  
+    *pte &= ~PTE_WW;  
+    *pte |= PTE_W;
   }
   
   // case2: some process enters
-  if ((num_of_shares[pa/PGSIZE] > 0) && ((*pte)&PTE_WAS_WRITABLE) && ((*pte)&PTE_SH)) {
-    if((mem = kalloc()) == 0)		// allocate memory
+  else if ((shares[pa/PGSIZE] > 0) && (*pte & PTE_WW) && (*pte & PTE_SH)) {
+    if((mem = kalloc()) == 0)
     	panic("handle_pgflt: failed to kalloc");
-    memmove(mem, (char*)P2V(pa), PGSIZE);  // move data to allocated memory
-    *pte &= ~PTE_SH;	// mark as Not shared (because just copied for this process use only)
-    *pte &= ~PTE_WAS_WRITABLE;	// ORIGINALLY writable not relevant anymore
-    *pte = (*pte & 0XFFF) | V2P(mem) | PTE_W;	// update entry & writable flag
-    goto finish_hadle_pgflt;
+    memmove(mem, (char*)P2V(pa), PGSIZE);
+    *pte &= ~PTE_SH;
+    *pte &= ~PTE_WW;
+    *pte = (*pte & 0XFFF) | V2P(mem) | PTE_W;
   }
   
-  // case3: process trying to write to ORIGINALLY read-only page
-  if (!((*pte)&PTE_WAS_WRITABLE)) {
-      cprintf("ACCESS VIOLATION! tried to write to read-only page. kill&exit\n");
-      myproc()->killed = 1;
-      exit(); 
-  }
-
-  
-finish_hadle_pgflt:
   flush_tbl_all();
 }
 
