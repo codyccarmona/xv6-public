@@ -9,6 +9,7 @@
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
+uchar num_of_shares[PHYSTOP/PGSIZE];
 
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
@@ -271,10 +272,7 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       if(pa == 0)
         panic("kfree");
       char *v = P2V(pa);
-      
-      if((*pte & PTE_W) != 0)
-        kfree(v);
-
+      kfree(v);
       *pte = 0;
     }
   }
@@ -352,41 +350,32 @@ bad:
 // of it for a child. - ccc13d
 pde_t*
 copyuvm_cow(pde_t *pgdir, uint sz){
-  pte_t *d;                 /* page directory for ch proc */
-  pte_t *pte;               /* parent page table entry ptr */
-  uint pa, i, flags;
-  char *mem;
-
+  pde_t *d;
+  pte_t *pte;
+  uint i, pa, flags;
+  char* mem;
+  
   if((d = setupkvm()) == 0)
     return 0;
+
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
-      panic("copyuvm: pte should exist");
-    if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    
-    pa = PTE_ADDR(*pte);      /* get physical address */
-    flags = PTE_FLAGS(*pte);
-
-    if((flags & PTE_U) != 0){     /* entry is for user-mode memory - do not copy */
-      flags &= ~PTE_W;     /* remove write flag */
-      
-      if(mappages(d, (void *)i, PGSIZE, pa, flags) < 0)
-        goto bad;
-    }
-    else{
-      if((mem = kalloc()) == 0) /* allocate new page */
-        goto bad;
-
-      memmove(mem, (char*)P2V(pa), PGSIZE); /* copy parent memory to this page */
-
-      if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {  /* maps new page to the child process */
-        kfree(mem);
-        goto bad;
-      }
-    }
+		  panic("copyuvm: pte should exist");
+	  if(!(*pte & PTE_P))
+		  panic("copyuvm: page not present");
+	  pa = PTE_ADDR(*pte);
+	  if((mem = kalloc()) == 0)
+		  goto bad;
+	  memmove(mem, (char*)P2V(pa), PGSIZE);
+	  if((*pte & PTE_W))
+      flags = PTE_W|PTE_U;
+    else
+      flags = PTE_U;
+    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0)
+			  goto bad;
   }
 
+  flush_tbl_all();
   return d;
 
 bad:
@@ -396,40 +385,54 @@ bad:
 
 void
 handle_pgflt(void){
-  uint faulting_addr, pa, flags;
+  char *mem;
   pte_t *pte;
-  char* mem;
+  uint pa;
+  
+  uint faultingAddress = read_cr2();
 
-  faulting_addr = read_cr2(); /* read the faulting address from cr2 */
-
-  /* get the physical address of the currently mapped physical frame from the page table (walkpgdir) */
-  if((pte = walkpgdir(myproc()->pgdir, (void *) faulting_addr, 0)) == 0)
+  if (faultingAddress==0) {
+    cprintf("NULL POINTER EXCEPTION! kill&exit\n");
+    myproc()->killed = 1;
+    exit();
+  }
+  
+  if ((pte = walkpgdir(myproc()->pgdir, (void*)faultingAddress , 0)) == 0)
     panic("handle_pgflt: pte should exist");
-
   if(!(*pte & PTE_P))
-    panic("handle_pgflt: page not present");
+      panic("handle_pgflt: page not present");
   
   pa = PTE_ADDR(*pte);
-  flags = PTE_FLAGS(*pte);
-
-  /* clone the frame into a new page */
-  if((mem = kalloc()) == 0)
-    return;
-
-  memmove(mem, (char *)P2V(pa), PGSIZE);
-
-  /* map the new page into the current process writable */
-  if((flags & PTE_W) == 0)
-    flags &= PTE_W;
-
-  if(mappages(myproc()->pgdir, (void *) faulting_addr, PGSIZE, V2P(mem), flags) < 0){
-    kfree(mem);
-    return;
+  
+  // case1: the process who enters is the last one between the process who share this page
+  if ((num_of_shares[pa/PGSIZE] == 0) && ((*pte)& PTE_WAS_WRITABLE)) {
+    *pte &= ~PTE_SH;  // disable Sharing for this page
+    *pte &= ~PTE_WAS_WRITABLE;  // no need for the ORIGINALLY writable flag
+    *pte |= PTE_W;	// update to writable
+    goto finish_hadle_pgflt;
+  }
+  
+  // case2: some process enters
+  if ((num_of_shares[pa/PGSIZE] > 0) && ((*pte)&PTE_WAS_WRITABLE) && ((*pte)&PTE_SH)) {
+    if((mem = kalloc()) == 0)		// allocate memory
+    	panic("handle_pgflt: failed to kalloc");
+    memmove(mem, (char*)P2V(pa), PGSIZE);  // move data to allocated memory
+    *pte &= ~PTE_SH;	// mark as Not shared (because just copied for this process use only)
+    *pte &= ~PTE_WAS_WRITABLE;	// ORIGINALLY writable not relevant anymore
+    *pte = (*pte & 0XFFF) | V2P(mem) | PTE_W;	// update entry & writable flag
+    goto finish_hadle_pgflt;
+  }
+  
+  // case3: process trying to write to ORIGINALLY read-only page
+  if (!((*pte)&PTE_WAS_WRITABLE)) {
+      cprintf("ACCESS VIOLATION! tried to write to read-only page. kill&exit\n");
+      myproc()->killed = 1;
+      exit(); 
   }
 
-  flush_tbl_all();  /* flush the TLB (flush_tlb_all) */
   
-  return;
+finish_hadle_pgflt:
+  flush_tbl_all();
 }
 
 //PAGEBREAK!
